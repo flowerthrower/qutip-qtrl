@@ -282,6 +282,39 @@ class TestOptimization:
             " qutip.Qobj or numpy.ndarray."
         )
 
+    def test_goat_approach(self, system, propagation):
+        """
+        Test the object-oriented version of the optimiser, and ensure that the
+        system truly appears to be at an extremum.
+        """
+        system = _merge_kwargs(system, propagation)
+        system = _merge_kwargs(system, {"alg": "GOAT",
+                                        "init_pulse_type": "GAUSSIAN"})
+        base = _optimize_pulse(system)
+        optimizer = cpo.create_pulse_optimizer(
+            system.system,
+            system.controls,
+            system.initial,
+            system.target,
+            **system.kwargs,
+        )
+        init_amps = np.array(
+            [optimizer.pulse_generator.gen_pulse() for _ in system.controls]
+        ).T
+        optimizer.dynamics.initialize_controls(init_amps)
+        # Check the gradient numerically.
+        func = optimizer.fid_err_func_wrapper
+        grad = optimizer.fid_err_grad_wrapper
+        loc = optimizer.dynamics.ctrl_amps.flatten()
+        assert (
+            abs(scipy.optimize.check_grad(func, grad, loc)) < 1e-5
+        ), "Gradient outside tolerance."
+        result = optimizer.run_optimization()
+        tol = system.kwargs["fid_err_targ"]
+        assert (
+            abs(result.fid_err - base.fid_err) < tol
+        ), "Direct and indirect methods produce different results."
+
     def test_object_oriented_approach_and_gradient(self, system, propagation):
         """
         Test the object-oriented version of the optimiser, and ensure that the

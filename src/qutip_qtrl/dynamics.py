@@ -1296,6 +1296,35 @@ class Dynamics(object):
         return self._dyn_gen_qobj
 
     @property
+    def dyn_gen_grad(self):
+        """
+        Array of combined dynamics generators gradients (Qobj) for each timeslot, control
+        """
+        if self._dyn_gen is not None:
+            if self._dyn_gen_qobj is None:
+                if self.oper_dtype == Qobj:
+                    self._dyn_gen_qobj = self._dyn_gen
+                else:
+                    self._dyn_gen_qobj = np.empty(
+                        [self.num_tslots, self.num_ctrls], dtype=object
+                    )
+                    for k in range(self.num_tslots):
+                        for j in range(self.num_ctrls):
+                            self._dyn_gen_qobj[k, j] = Qobj(
+                                self._dyn_gen[k, j], dims=self.dyn_dims
+                            )
+        return self._dyn_gen_qobj
+
+    def _dyn_gen_grad(self, k, j):
+        if self.cache_dyn_gen:
+            dyn_gen = self._dyn_gen[k, j]
+        else:
+            dyn_gen = self.prop_computer._compute_dyn_gen(
+                k, j, compute_prop=False
+            )
+        return dyn_gen
+
+    @property
     def prop(self):
         """
         List of propagators (Qobj) for each timeslot

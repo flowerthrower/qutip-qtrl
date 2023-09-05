@@ -1835,6 +1835,11 @@ def create_pulse_optimizer(
         raise errors.UsageError(
             "Optimisation algorithm must be specified through 'alg' parameter"
         )
+    elif alg == "GOAT":
+        if optim_method is None or optim_method.upper() == "DEF":
+            optim_method = "LBFGSB"
+        if init_pulse_type is None or init_pulse_type.upper() == "DEF":
+            init_pulse_type = "GAUSSIAN"
     elif alg_up == "GRAPE":
         if optim_method is None or optim_method.upper() == "DEF":
             optim_method = "FMIN_L_BFGS_B"

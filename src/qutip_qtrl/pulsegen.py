@@ -913,6 +913,37 @@ class PulseGenGaussian(PulseGen):
         pulse = self.scaling * np.exp(-((t - Tm) ** 2) / (2 * Tv))
         return self._apply_bounds_and_offset(pulse)
 
+    def pulse_grad(self, mean=None, variance=None):
+        """
+        Generate a pulse with Gaussian shape. The peak is centre around the
+        mean and the variance determines the breadth
+        The scaling and offset attributes are applied as an amplitude
+        and fixed linear offset. Note that the maximum amplitude will be
+        scaling + offset.
+        """
+        x, y, z = None, None, None
+
+        x = self.scaling
+        if mean:
+            y = mean
+        else:
+            y = self.mean
+        if variance:
+            z = variance
+        else:
+            z = self.variance
+        t = self.time
+
+        dx = exp = np.exp(-((t - y) ** 2) / (2 * z))
+        if mean == None: return np.vstack([dx])
+
+        dy = x * exp * (t - y) / (z)
+        if variance == None: return np.vstack([dx, dy])
+
+        dz = x * exp * ((t - y) ** 2) / (2 * z ** 2)
+        return np.vstack([dx, dy, dz])
+
+
 
 class PulseGenGaussianEdge(PulseGen):
     """

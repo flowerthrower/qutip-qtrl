@@ -30,7 +30,7 @@ import warnings
 import numpy as np
 
 # QuTiP
-from qutip import Qobj
+from qutip import Qobj, QobjEvo, sesolve
 
 # QuTiP control modules
 import qutip_qtrl.errors as errors
@@ -471,7 +471,11 @@ class FidCompUnitary(FidelityComputer):
         """
         if not self.fid_err_grad_current:
             dyn = self.parent
-            grad_prenorm = self.compute_fid_grad()
+            opt = dyn.parent
+            if opt.alg is not "GOAT":
+                grad_prenorm =  self.compute_fid_grad()
+            else:
+                grad_prenorm = self.compute_grad()
             if self.log_level <= logging.DEBUG_INTENSE:
                 logger.log(
                     logging.DEBUG_INTENSE,
@@ -504,6 +508,49 @@ class FidCompUnitary(FidelityComputer):
                 )
 
         return self.fid_err_grad
+    
+    def calc_dH(self, dyn):
+        opt = dyn.parent
+        dc = opt.pulse_generator.pulse_grad()
+        Hc = np.array(dyn.ctrl_ham)
+        dH = Hc * dc
+        return dH.squeeze()
+
+    def compute_from_EOM(self, dyn):
+        """ calculates U and dU i.e. the derivative of the evolution operator U
+            wrt the control parameters
+        """
+        init = dyn.initial.full()
+        init_arr = np.concatenate([init, np.zeros(dyn.initial.shape)])
+        psi0 = Qobj(init_arr) # inital state of coupled system (U, dU)
+
+        dH = self.calc_dH(dyn) # derivative of Hamiltonian wrt control parameters
+
+        H = [dyn._get_phased_dyn_gen(k) for k in range(dyn.num_tslots)]        
+        H_r1 = [np.hstack([h, np.zeros(h.shape)]) for h in H]       # ( H, 0) row 1
+        H_r2 = [np.hstack([dh.full(), h]) for dh, h in zip(dH, H)]  # (dH, H) row 2
+        H = [Qobj(np.vstack([h_r1, h_r2])) for h_r1, h_r2 in zip(H_r1, H_r2)]
+        H = QobjEvo(H) # Hamiltonian for coupled system (U, dU)
+
+        res = sesolve(H, psi0, dyn.time)
+        U  = [s[:init.shape[0], :init.shape[1]] for s in res.states]
+        dU = [s[init.shape[0]:, :init.shape[1]] for s in res.states]
+        return U, dU
+    
+    def compute_grad(self):
+        """ GOAT gradient calculation """
+        dyn = self.parent
+        U_goal = dyn.target # target evolution operator
+        norm = 1 / np.sum(U_goal.dims)# TODO: check dims
+
+        U, dU = self.compute_from_EOM(dyn)
+        trc = (U_goal.dag() @ Qobj(dU[-1])).tr()
+        g = 1 - norm * np.abs(((U_goal.dag() @ Qobj(U[-1])).tr())) # goal function (fidelity) to be minimized
+
+        grd = (g.conj() / np.abs(g)) * norm 
+        grd = -(grd * trc).real # -Re(... * Tr(...))
+        return grd
+
 
     def compute_fid_grad(self):
         """
