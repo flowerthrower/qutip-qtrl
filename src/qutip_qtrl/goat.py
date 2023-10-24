@@ -2,28 +2,15 @@
 This module contains functions that implement the GOAT algorithm to
 calculate optimal parameters for analytical control pulse sequences.
 """
+import importlib
+
 import qutip as qt
 from qutip import Qobj, QobjEvo
 
 import numpy as NP  # might be overwritten by jax.numpy
 import scipy as sp
 
-#from result import Result
-
-
-def enable_jnp():
-    """
-    Switch from NumPy(default) to JAX NumPy.
-    """
-    global jax, qutip_jax, NP
-    try:
-        import jax
-        import qutip_jax
-        import jax.numpy as NP
-    except ImportError:
-        raise ImportError(
-            "JAX not available, make sure jax and qutip_jax are installed."
-        )
+# from result import Result
 
 
 class GOAT:
@@ -48,8 +35,11 @@ class GOAT:
         self.target = objective.target
 
         # extract control functions and gradients from the objective
-        self.controls = [H[1] for H in objective.H[1:]] 
-        self.grads = [H[2]["grad"] for H in objective.H[1:]]
+        self.controls = [H[1] for H in objective.H[1:]]
+        self.grads = [H[2].get("grad", None) for H in objective.H[1:]]
+        if None in self.grads:
+            raise KeyError("No gradient function found for control function "
+                           "at index {}.".format(self.grads.index(None)))
 
         self.evo_time = evo_time  # [T_i, T_f]
         self.para_counts = para_counts  # num of params for each control function
@@ -60,19 +50,7 @@ class GOAT:
         self.norm = 1 / self.target.shape[0] if self.target.isoper else 1
         self.sys_size = self.Hd.shape[0]
         self.tot_n_para = sum(self.para_counts)  # incl. time if var_t==True
-
-        # jit compile functions if using JAX
-        self.useJAX = integrator_options.get("method", "") == "diffrax"
-
-        if self.useJAX:
-            self.solve_EOM = self.solve_EOM_jax
-            self.comp_infidelity = jax.jit(self.comp_infid)
-            self.initial.to("jax")
-            self.target.to("jax")
-            # TODO: jit comp_grad
-        else:
-            self.solve_EOM = self.solve_EOM_numpy
-            self.comp_infidelity = self.comp_infid
+        self.use_jax = integrator_options.get("method", "") == "diffrax"
 
         # Scale the system Hamiltonian and initial state
         # for coupled system (U, dU)
@@ -80,11 +58,24 @@ class GOAT:
         self.dH = self.prepare_dH()
         self.psi0 = self.prepare_psi0()
 
-        # initialize the solver
         # TODO: why does QobjEvo require init_params?
         init_params = NP.ones(self.tot_n_para)
+        self.evo = QobjEvo(self.H + self.dH, {"p": init_params})
+
+        if self.use_jax:
+            # jit compile functions if using JAX
+            self.solve_EOM = self.solve_EOM_jax
+            self.comp_infidelity = jax.jit(self.comp_infid)
+            # use JaxDia for efficient computation
+            self.target = self.target.to("jaxdia")
+            # TODO: jit comp_grad
+        else:
+            self.solve_EOM = self.solve_EOM_numpy
+            self.comp_infidelity = self.comp_infid
+
+        # initialize the solver
         self.solver = qt.SESolver(
-            QobjEvo(self.H + self.dH, {"p": init_params}),
+            H=self.evo,
             options=self.integrator_options
         )
 
@@ -100,7 +91,7 @@ class GOAT:
             ([1], ([0], [0])), shape=(1 + self.tot_n_para, 1)
         )
         psi0 = Qobj(scale) & self.initial
-        return psi0 if self.useJAX == False else psi0.to("jax")
+        return psi0 if self.use_jax == False else psi0.to("jaxdia")
 
     def prepare_H(self):
         """
@@ -108,19 +99,21 @@ class GOAT:
         """
         def coeff(control, lower, upper):
             # helper function to fix arguments in loop
-            if self.useJAX == False:
+            if self.use_jax == False:
                 return lambda t, p: control(t, p[lower:upper])
             else:  # coeff must be jit compiled to be recognized by qutip_jax
                 return jax.jit(lambda t, p: control(t, p[lower:upper]))
 
         diag = qt.qeye(1 + self.tot_n_para)
-        H = [diag & self.Hd]
+        H = [diag & self.Hd if self.use_jax == False
+             else (diag & self.Hd).to("jaxdia")]
         idx = 0
 
         # H = [Hd, [H0, c0(t)], ...]
 
         for control, M, Hc in zip(self.controls, self.para_counts, self.Hc_lst):
-            hc = diag & Hc if self.useJAX == False else (diag & Hc).to("jax")
+            hc = diag & Hc if self.use_jax == False else\
+                (diag & Hc).to("jaxdia")
             H.append([hc, coeff(control, idx, idx + M)])
             idx += M
         return H  # list to construct QobjEvo
@@ -131,7 +124,7 @@ class GOAT:
         """
         def coeff(grad, lower, upper, idx):
             # helper function to fix arguments in loop
-            if self.useJAX == False:
+            if self.use_jax == False:
                 return lambda t, p: grad(t, p[lower:upper], idx)
             else:  # coeff must be jit compiled to be recognized by qutip_jax
                 return jax.jit(lambda t, p: grad(t, p[lower:upper], idx))
@@ -146,8 +139,8 @@ class GOAT:
             for grad_idx in range(M + int(self.var_t)):
                 i = 1 + idx + grad_idx if grad_idx < M else self.tot_n_para
                 csr = sp.sparse.csr_matrix(([1], ([i], [0])), csr_shape)
-                hc = Qobj(csr) & Hc if self.useJAX == False else\
-                    (Qobj(csr) & Hc).to("jax")
+                hc = Qobj(csr) & Hc if self.use_jax == False else\
+                    (Qobj(csr) & Hc).to("jaxdia")
                 dH.append([hc, coeff(grad, idx, idx + M, grad_idx)])
             idx += M
         return dH  # list to construct QobjEvo
@@ -173,10 +166,10 @@ class GOAT:
         jax_res = res.final_state.data._jxa
         U = jax.lax.slice(jax_res,
                           (0, 0),
-                          (self.sys_size, self.sys_size))
+                          (self.sys_size, jax_res.shape[1]))
         dU = jax.lax.slice(jax_res,
                            (self.sys_size, 0),
-                           (jax_res.shape[0], self.sys_size))
+                           (jax_res.shape[0], jax_res.shape[1]))
         return U, dU
 
     def comp_infid(self, params):
@@ -205,13 +198,14 @@ class GOAT:
         according to GOAT algorithm: arXiv:1507.04261
         """
         dU, g = self.dU, self.g  # both calculated before
+        dU_size = dU.shape[1]  # number of columns
 
         trc = []  # collect for each parameter
         for i in range(self.tot_n_para):
             idx = i * self.sys_size  # row index for parameter set i
-            if self.useJAX:
+            if self.use_jax:
                 slice = jax.lax.slice(
-                    dU, (idx, 0), (idx + self.sys_size, self.sys_size))
+                    dU, (idx, 0), (idx + self.sys_size, dU_size))
             else:
                 slice = dU[idx: idx + self.sys_size, :]
             du = Qobj(slice)
@@ -242,7 +236,7 @@ class Multi_GOAT:
 
     def goal_fun(self, params):
         i = 0
-        for goat in self.goats: # TODO: parallelize
+        for goat in self.goats:  # TODO: parallelize
             goat.infid, goat.g, goat.U, goat.dU = goat.comp_infidelity(params)
             if goat.infid < 0:
                 print(
@@ -443,6 +437,16 @@ def optimize_pulses(
     # integrator must not normalize output
     integrator_kwargs["normalize_output"] = False
 
+    global NP, jax, qutip_jax
+    # import qutip_jax, jax.numpy and jax if using JAX
+    if integrator_kwargs.get("method", False) == "diffrax":
+        selection = "jaxdia"
+        NP = importlib.import_module("jax.numpy")
+        jax = importlib.import_module("jax")
+        qutip_jax = importlib.import_module("qutip_jax")
+    else:
+        selection = None
+
     # extract initial and boundary values
     x0, bounds, para_counts = [], [], []
     for key in pulse_options.keys():
@@ -458,43 +462,39 @@ def optimize_pulses(
     # optimize time, when "time" is in pulse_options
     var_t = True if pulse_options.get("time", False) else False
     evo_time = NP.array([tlist[0], tlist[-1]])
-    
-    # import qutip_jax, jax.numpy as NP if needed
-    use_jax = integrator_kwargs.get("method", "") == "diffrax"
-    selection = "jax" if use_jax else None
-    if use_jax: enable_jnp()
 
     # initialize the Multi_GOAT instance
     with qt.CoreOptions(default_dtype=selection):
         goats = Multi_GOAT(objectives, evo_time, para_counts,
                            var_t, **integrator_kwargs)
 
-    ## define the result Krotov style
-    #result = Result(tlist, objectives)
-    #result.start_time()
+    # define the result Krotov style
+    # result = Result(tlist, objectives)
+    # result.start_time()
 
     min_res = sp.optimize.basinhopping(
         func=goats.goal_fun,
         minimizer_kwargs={
             'jac': goats.comp_grad,
             'callback': lambda xk: print(
-                "Minimizer step, infidelity: ", goats.mean_infid),
-            **minimizer_kwargs
+                "Minimizer step, infidelity: $%.2f" % goats.mean_infid
+            ) if minimizer_kwargs.get("disp", False) else None,
+            ** minimizer_kwargs
         },
         callback=lambda xk, f, accept: print(
-            "took $%.2f seconds" 
-            #%result.time_iter()
-            ),
-        **optimizer_kwargs
+            "took $%.2f seconds"
+            # %result.time_iter()
+        ) if optimizer_kwargs.get("disp", False) else None,
+        ** optimizer_kwargs
     )
 
-    #result.end_time()
-    #result.generate_optimized_controls(
+    # result.end_time()
+    # result.generate_optimized_controls(
     #    optimizer_kwargs["x0"], min_res.x, goats.get_parameterized_controls()
-    #)
-    #result.final_result(
+    # )
+    # result.final_result(
     #    U_final=[g.U for g in goats.goats],
     #    min_res=min_res,
-    #)
+    # )
 
     return min_res
